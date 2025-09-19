@@ -1,9 +1,7 @@
 // api/clean.js
-export const config = { runtime: 'nodejs20.x' };
+export const config = { runtime: 'nodejs' }; // ✅ giá trị hợp lệ
 
-// Vercel Serverless Function: POST JSON { "url": "..." } -> { input, resolved, cleaned }
-// Kèm CORS & body parser để dùng được từ iPhone Shortcuts
-
+// Vercel Serverless Function: POST { "url": "..." } -> { input, resolved, cleaned }
 const USER_AGENT =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile Safari';
 const MAX_REDIRECTS = 10;
