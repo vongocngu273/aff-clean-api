@@ -1,3 +1,0 @@
-{
-  "functions": { "api/clean.js": { "runtime": "nodejs18.x" } }
-}
