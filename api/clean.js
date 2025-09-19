@@ -1,12 +1,34 @@
-// Vercel Serverless: POST JSON { "url": "..." } -> { input, resolved, cleaned, platform }
+// api/clean.js
 export const config = { runtime: 'nodejs' };
 
+import { fetch as undiciFetch, Headers as UndiciHeaders } from 'undici';
+
 const UA =
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile Safari';
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const MAX_HOPS = 10;
 const MAX_HTML_BYTES = 256 * 1024;
 
-/* ---------- utils ---------- */
+/* ---------------- Cookie jar (đơn giản) ---------------- */
+function parseSetCookie(setCookieHeader) {
+  // chấp nhận mảng hoặc string
+  const arr = Array.isArray(setCookieHeader) ? setCookieHeader : (setCookieHeader ? [setCookieHeader] : []);
+  const jar = {};
+  for (const line of arr) {
+    const [pair] = line.split(';');
+    const idx = pair.indexOf('=');
+    if (idx > 0) {
+      const k = pair.slice(0, idx).trim();
+      const v = pair.slice(idx + 1).trim();
+      if (k && v) jar[k] = v;
+    }
+  }
+  return jar;
+}
+function cookieJarToHeader(jar) {
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+/* ---------------- utils ---------------- */
 function isHtml(ct) {
   return typeof ct === 'string' && ct.toLowerCase().includes('text/html');
 }
@@ -35,11 +57,10 @@ function detectPlatform(urlStr) {
   return 'other';
 }
 function cleanByPlatform(urlStr) {
-  // Hiện tại: giữ origin + pathname cho cả 3 sàn
   return stripAllQueriesKeepOriginPath(urlStr);
 }
 
-/* ---------- HTML redirect extraction ---------- */
+/* ---------------- HTML redirect extractors ---------------- */
 function extractFromMetaRefresh(html, baseUrl) {
   const m = html.match(
     /<meta\s+http-equiv=["']?refresh["']?\s+content=["'][^"'>]*url=([^"'>\s]+)[^"'>]*["']?>/i
@@ -47,7 +68,6 @@ function extractFromMetaRefresh(html, baseUrl) {
   if (!m) return null;
   return absolute(baseUrl, m[1]);
 }
-
 function extractFromJs(html, baseUrl) {
   // 1) window.location / location.href / assign / replace
   const js1 = html.match(
@@ -75,23 +95,40 @@ function extractFromJs(html, baseUrl) {
     } catch {}
   }
 
-  // 4) A single prominent anchor as fallback
+  // 4) anchor fallback
   const a = html.match(/<a[^>]+href=["']([^"']+)["'][^>]*>(?:\s*click\s*here|here|tiếp tục|continue|redirect)/i);
   if (a) return absolute(baseUrl, a[1]);
 
   return null;
 }
 
-/* ---------- Resolve chain with manual redirect ---------- */
-async function fetchOnce(current) {
-  const res = await fetch(current, {
-    method: 'GET',
-    redirect: 'manual', // handle 3xx ourselves to see every hop
-    headers: {
-      'user-agent': UA,
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    }
+/* ---------------- low-level fetch + cookies ---------------- */
+async function fetchOnce(current, jar, referer = '') {
+  const headers = new UndiciHeaders({
+    'user-agent': UA,
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'accept-language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    'upgrade-insecure-requests': '1',
+    'sec-fetch-site': 'none',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-user': '?1',
+    'sec-fetch-dest': 'document'
   });
+  if (referer) headers.set('referer', referer);
+  const cookieHeader = cookieJarToHeader(jar);
+  if (cookieHeader) headers.set('cookie', cookieHeader);
+
+  const res = await undiciFetch(current, {
+    method: 'GET',
+    redirect: 'manual',
+    headers
+  });
+
+  // collect Set-Cookie
+  const setCookie = res.headers.getSetCookie?.() ?? res.headers.get('set-cookie');
+  const newCookies = parseSetCookie(setCookie);
+  Object.assign(jar, newCookies);
+
   return res;
 }
 
@@ -111,33 +148,36 @@ async function readHtml(res) {
 
 async function resolveUrl(inputUrl) {
   let current = inputUrl;
-  for (let i = 0; i < MAX_HOPS; i++) {
-    const res = await fetchOnce(current);
+  let referer = '';
+  const jar = {};
 
-    // 3xx Location header
+  for (let i = 0; i < MAX_HOPS; i++) {
+    const res = await fetchOnce(current, jar, referer);
+
+    // 3xx Location
     const loc = res.headers.get('location');
     if (loc && res.status >= 300 && res.status < 400) {
       const next = absolute(current, loc);
-      if (next) { current = next; continue; }
+      if (next) { referer = current; current = next; continue; }
     }
 
-    // 200 HTML with meta-refresh or JS redirect
+    // 200 with HTML: meta-refresh / JS redirect
     const ct = res.headers.get('content-type') || '';
     if (isHtml(ct)) {
       const html = await readHtml(res);
       const viaMeta = extractFromMetaRefresh(html, current);
-      if (viaMeta) { current = viaMeta; continue; }
+      if (viaMeta) { referer = current; current = viaMeta; continue; }
       const viaJs = extractFromJs(html, current);
-      if (viaJs) { current = viaJs; continue; }
+      if (viaJs) { referer = current; current = viaJs; continue; }
     }
 
-    // Consider current as final
+    // If not redirected further → final
     return current;
   }
   throw new Error('Too many hops while resolving');
 }
 
-/* ---------- HTTP handler ---------- */
+/* ---------------- read JSON body ---------------- */
 async function readJson(req) {
   return await new Promise((resolve, reject) => {
     let data = '';
@@ -147,12 +187,14 @@ async function readJson(req) {
   });
 }
 
+/* ---------------- handler ---------------- */
 export default async function handler(req, res) {
-  // CORS (handy for clients; Shortcuts works either way)
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'content-type');
   if (req.method === 'OPTIONS') return res.status(204).end();
+
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
   try {
